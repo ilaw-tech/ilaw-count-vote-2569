@@ -243,12 +243,29 @@ const fmt = (n) => (n || 0).toLocaleString('th-TH');
 
 function Dropdown({ value, onChange, options, placeholder, disabled, accent = '#0071e3', dark }) {
   const [open, setOpen] = React.useState(false);
+  const [activeIndex, setActiveIndex] = React.useState(-1);
   const ref = React.useRef(null);
+  const listRef = React.useRef(null);
+  const buttonRef = React.useRef(null);
   React.useEffect(() => {
     const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
     document.addEventListener('mousedown', onDoc);
     return () => document.removeEventListener('mousedown', onDoc);
   }, []);
+  // When opening, set activeIndex to the currently selected option (or 0)
+  React.useEffect(() => {
+    if (open) {
+      const selIdx = options.findIndex((o) => o.value === value);
+      setActiveIndex(selIdx >= 0 ? selIdx : 0);
+    }
+  }, [open]);
+  // Scroll active option into view
+  React.useEffect(() => {
+    if (open && activeIndex >= 0 && listRef.current) {
+      const el = listRef.current.children[activeIndex];
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+    }
+  }, [activeIndex, open]);
   const selected = options.find((o) => o.value === value);
   const bg = dark ? '#1c1c1e' : '#fff';
   const border = dark ? '#2c2c2e' : '#d2d2d7';
@@ -256,9 +273,42 @@ function Dropdown({ value, onChange, options, placeholder, disabled, accent = '#
   const muted = '#86868b';
   const hover = dark ? '#2c2c2e' : '#f5f5f7';
 
+  const handleKeyDown = (e) => {
+    if (disabled) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!open) { setOpen(true); return; }
+      setActiveIndex((i) => Math.min(options.length - 1, i + 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!open) { setOpen(true); return; }
+      setActiveIndex((i) => Math.max(0, i - 1));
+    } else if (e.key === 'Enter' || (e.key === ' ' && open)) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!open) { setOpen(true); return; }
+      if (activeIndex >= 0 && options[activeIndex]) {
+        onChange(options[activeIndex].value);
+        setOpen(false);
+        if (buttonRef.current) buttonRef.current.focus();
+      }
+    } else if (e.key === 'Escape' && open) {
+      e.preventDefault();
+      e.stopPropagation();
+      setOpen(false);
+      if (buttonRef.current) buttonRef.current.focus();
+    } else if (e.key === 'Home' && open) {
+      e.preventDefault();
+      setActiveIndex(0);
+    } else if (e.key === 'End' && open) {
+      e.preventDefault();
+      setActiveIndex(options.length - 1);
+    }
+  };
+
   return (
-    <div ref={ref} style={{ position: 'relative', width: '100%' }}>
-      <button type="button" disabled={disabled} onClick={() => !disabled && setOpen((o) => !o)}
+    <div ref={ref} style={{ position: 'relative', width: '100%' }} onKeyDown={handleKeyDown}>
+      <button ref={buttonRef} type="button" disabled={disabled} onClick={() => !disabled && setOpen((o) => !o)}
         style={{
           width: '100%', background: bg,
           border: `1px solid ${open ? accent : border}`,
@@ -278,7 +328,7 @@ function Dropdown({ value, onChange, options, placeholder, disabled, accent = '#
         </span>
       </button>
       {open && (
-        <div style={{
+        <div ref={listRef} style={{
           position: 'absolute', top: 'calc(100% + 6px)', left: 0, right: 0,
           background: bg, border: `1px solid ${border}`, borderRadius: 12,
           boxShadow: dark ? '0 12px 32px rgba(0,0,0,0.5)' : '0 12px 32px rgba(0,0,0,0.12)',
@@ -287,19 +337,23 @@ function Dropdown({ value, onChange, options, placeholder, disabled, accent = '#
           {options.length === 0 && (
             <div style={{ padding: 12, color: muted, fontSize: 14 }}>ไม่มีตัวเลือก</div>
           )}
-          {options.map((o) => (
-            <div key={o.value} onClick={() => { onChange(o.value); setOpen(false); }}
-              style={{
-                padding: '10px 12px', fontSize: 15, color: fg,
-                borderRadius: 8, cursor: 'pointer',
-                background: o.value === value ? `${accent}15` : 'transparent',
-                fontWeight: o.value === value ? 600 : 400,
-              }}
-              onMouseEnter={(e) => { if (o.value !== value) e.currentTarget.style.background = hover; }}
-              onMouseLeave={(e) => { if (o.value !== value) e.currentTarget.style.background = 'transparent'; }}>
-              {o.label}
-            </div>
-          ))}
+          {options.map((o, idx) => {
+            const isSelected = o.value === value;
+            const isActive = idx === activeIndex;
+            return (
+              <div key={o.value}
+                onClick={() => { onChange(o.value); setOpen(false); if (buttonRef.current) buttonRef.current.focus(); }}
+                onMouseEnter={() => setActiveIndex(idx)}
+                style={{
+                  padding: '10px 12px', fontSize: 15, color: fg,
+                  borderRadius: 8, cursor: 'pointer',
+                  background: isActive ? hover : (isSelected ? `${accent}15` : 'transparent'),
+                  fontWeight: isSelected ? 600 : 400,
+                }}>
+                {o.label}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -311,17 +365,15 @@ function ScoreInput({ value, onChange, dark, accent, autoFocus, onLastEnter }) {
   const bg = dark ? '#1c1c1e' : '#fff';
   const border = dark ? '#2c2c2e' : '#d2d2d7';
   const fg = dark ? '#f5f5f7' : '#1d1d1f';
+  // Use type=text + inputMode=numeric instead of type=number to avoid:
+  //   (a) desktop mouse-wheel changing value when input is focused
+  //   (b) browser auto-validation returning empty e.target.value mid-typing
+  //   (c) up/down arrow keys stepping the value unintentionally
   const handleKeyDown = (e) => {
-    // Block typing characters that produce negative / scientific values
-    if (e.key === '-' || e.key === '+' || e.key === 'e' || e.key === 'E') {
-      e.preventDefault();
-      return;
-    }
     if (e.key === 'Enter') {
       e.preventDefault();
       e.stopPropagation();
-      // Move focus to next number input in DOM order, else fall through to onLastEnter
-      const all = Array.from(document.querySelectorAll('input[type="number"]'));
+      const all = Array.from(document.querySelectorAll('input[data-score-input="1"]'));
       const idx = all.indexOf(e.target);
       const next = all[idx + 1];
       if (next) next.focus();
@@ -329,12 +381,14 @@ function ScoreInput({ value, onChange, dark, accent, autoFocus, onLastEnter }) {
     }
   };
   return (
-    <input type="number" min="0" placeholder="0" value={value || ''}
+    <input type="text" inputMode="numeric" pattern="[0-9]*" placeholder="0"
+      data-score-input="1"
+      value={value == null ? '' : String(value)}
       autoFocus={autoFocus}
       onChange={(e) => {
-        const v = e.target.value;
-        if (v.startsWith('-')) return;  // belt-and-suspenders if browser allows
-        onChange(v);
+        // Strip everything that isn't a digit (handles paste, IME, Thai numerals via copy, etc.)
+        const cleaned = e.target.value.replace(/[^0-9]/g, '');
+        onChange(cleaned);
       }}
       onKeyDown={handleKeyDown}
       onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
@@ -500,10 +554,9 @@ function CardLocation({ flow, T, accent, dark }) {
         <GroupedRow T={T} label="ประเภทหน่วย" last>
           <Dropdown value={state.unitType} onChange={setUnitType}
             options={[
-              { value: 'normal', label: 'คะแนนรายหน่วย' },
-              { value: 'advance-out', label: 'เลือกตั้งล่วงหน้านอกเขต' },
+              { value: 'normal', label: 'คะแนนหน้าหน่วย' },
               { value: 'advance-in', label: 'เลือกตั้งล่วงหน้าในเขต' },
-              { value: 'overseas', label: 'นอกราชอาณาจักร' },
+              { value: 'advance-out', label: 'เลือกตั้งล่วงหน้านอกเขต/นอกราชอาณาจักร' },
             ]}
             placeholder="เลือกประเภท" disabled={!state.district} accent={accent} dark={dark}/>
         </GroupedRow>
@@ -538,8 +591,8 @@ function CardLocation({ flow, T, accent, dark }) {
       {isSpecialUnit && (
         <FormCard T={T}>
           <GroupedRow T={T} label="ใบที่" last>
-            <input type="number" min="1" max="99" value={state.sheetNo}
-              onChange={(e) => setSheetNo(e.target.value)}
+            <input type="text" inputMode="numeric" pattern="[0-9]*" value={state.sheetNo}
+              onChange={(e) => setSheetNo(e.target.value.replace(/[^0-9]/g, '').slice(0, 2))}
               placeholder="เช่น 1, 2, 3..."
               style={{
                 width: '100%', background: dark ? '#1c1c1e' : '#fff', color: T.fg,
@@ -885,9 +938,8 @@ function ChipsCard({ flow, T }) {
     state.unitType === 'normal' && state.amphoe,
     state.unitType === 'normal' && state.tambon,
     state.unitType === 'normal' && state.unit && `หน่วย ${state.unit}`,
-    state.unitType === 'advance-out' && 'ล่วงหน้านอกเขต',
     state.unitType === 'advance-in'  && 'ล่วงหน้าในเขต',
-    state.unitType === 'overseas'    && 'นอกราชอาณาจักร',
+    (state.unitType === 'advance-out' || state.unitType === 'overseas') && 'ล่วงหน้านอกเขต/นอกราชฯ',
     state.unitType !== 'normal' && state.unitType !== '' && state.sheetNo && `ใบที่ ${state.sheetNo}`,
   ].filter(Boolean);
   if (chips.length === 0) return null;
@@ -1097,10 +1149,9 @@ function DLocation({ flow, T, accent, narrow, dark }) {
               <DField label="ประเภทหน่วย" T={T}>
                 <Dropdown value={state.unitType} onChange={setUnitType}
                   options={[
-                    { value: 'normal', label: 'คะแนนรายหน่วย' },
-                    { value: 'advance-out', label: 'เลือกตั้งล่วงหน้านอกเขต' },
+                    { value: 'normal', label: 'คะแนนหน้าหน่วย' },
                     { value: 'advance-in', label: 'เลือกตั้งล่วงหน้าในเขต' },
-                    { value: 'overseas', label: 'นอกราชอาณาจักร' },
+                    { value: 'advance-out', label: 'เลือกตั้งล่วงหน้านอกเขต/นอกราชอาณาจักร' },
                   ]}
                   placeholder="เลือกประเภท" disabled={!state.district} accent={accent.zone} dark={dark}/>
               </DField>
@@ -1135,8 +1186,8 @@ function DLocation({ flow, T, accent, narrow, dark }) {
             {isSpecialUnit && (
               <div style={{ gridColumn: '1 / -1' }}>
                 <DField label="ใบที่" T={T}>
-                  <input type="number" min="1" max="99" value={state.sheetNo}
-                    onChange={(e) => setSheetNo(e.target.value)}
+                  <input type="text" inputMode="numeric" pattern="[0-9]*" value={state.sheetNo}
+                    onChange={(e) => setSheetNo(e.target.value.replace(/[^0-9]/g, '').slice(0, 2))}
                     placeholder="เช่น 1, 2, 3..."
                     style={{
                       width: '100%', background: dark ? '#1c1c20' : '#fff', color: T.fg,
@@ -1356,24 +1407,27 @@ function DConfirm({ flow, T, accent, narrow }) {
             <h1 style={{ fontSize: narrow ? 22 : 26, fontWeight: 600, letterSpacing: '-0.02em', marginBottom: 4 }}>ยืนยันก่อนส่ง</h1>
             <p style={{ fontSize: 13, color: T.muted }}>โปรดตรวจทานให้ละเอียด เมื่อส่งแล้วจะแก้ไขไม่ได้อีก</p>
           </div>
-          <ValidationAlert T={T} validation={validation} dark={dark}/>
           {hasBlocking ? (
-            <div style={{ display: 'grid', gridTemplateColumns: narrow ? '1fr' : '1fr 360px', gap: 16, alignItems: 'start' }}>
-              <div>
-                <div style={{
-                  padding: '10px 14px', borderRadius: 10, fontSize: 12,
-                  background: dark ? '#1e2a3a' : '#eff6ff',
-                  color: dark ? '#93c5fd' : '#1e40af',
-                  marginBottom: 12, lineHeight: 1.5,
-                }}>
-                  ✏️ แก้ค่าด้านล่างได้เลย — alert จะหายเองเมื่อผลรวมตรงกัน
-                </div>
-                <DesktopScoreForm flow={flow} T={T} accent={accent} dark={dark}/>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, position: narrow ? 'static' : 'sticky', top: 0 }}>
+            <>
+              {/* Top row: Alert + Override side-by-side on wide screens; stacked on narrow */}
+              <div style={{ display: 'grid', gridTemplateColumns: narrow ? '1fr' : '1fr 360px', gap: 16, alignItems: 'start', marginBottom: 16 }}>
+                <ValidationAlert T={T} validation={validation} dark={dark}/>
                 <OverrideBox T={T} state={state} setOverride={setOverride} setOther={setOther}
                   setOverrideNote={setOverrideNote} dark={dark}/>
-                <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 14, padding: 20 }}>
+              </div>
+              {/* Hint */}
+              <div style={{
+                padding: '10px 14px', borderRadius: 10, fontSize: 12,
+                background: dark ? '#1e2a3a' : '#eff6ff',
+                color: dark ? '#93c5fd' : '#1e40af',
+                marginBottom: 12, lineHeight: 1.5,
+              }}>
+                ✏️ แก้ค่าด้านล่างได้เลย — alert จะหายเองเมื่อผลรวมตรงกัน
+              </div>
+              {/* Bottom row: Score form + unit summary */}
+              <div style={{ display: 'grid', gridTemplateColumns: narrow ? '1fr' : '1fr 360px', gap: 16, alignItems: 'start' }}>
+                <DesktopScoreForm flow={flow} T={T} accent={accent} dark={dark}/>
+                <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 14, padding: 20, position: narrow ? 'static' : 'sticky', top: 0 }}>
                   <div style={{ fontSize: 11, fontWeight: 600, color: T.muted, textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 10 }}>หน่วย</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
                     <DSumRow label="จังหวัด" value={state.province} T={T}/>
@@ -1385,7 +1439,7 @@ function DConfirm({ flow, T, accent, narrow }) {
                   </div>
                 </div>
               </div>
-            </div>
+            </>
           ) : (
             <div style={{ display: 'grid', gridTemplateColumns: narrow ? '1fr' : '1fr 360px', gap: 16 }}>
               <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 14, overflow: 'hidden' }}>
@@ -1821,14 +1875,14 @@ function buildValidation(state, totals) {
     {
       id: 'cand',
       ok: totals.sumScores === totals.valid,
-      label: 'ผลรวมคะแนนผู้สมัคร = บัตรดี',
+      label: 'จำนวนบัตรไม่ตรงกัน',
       left:  { name: 'ผลรวมคะแนนผู้สมัคร', value: totals.sumScores },
       right: { name: 'บัตรดี', value: totals.valid },
     },
     {
       id: 'ballot',
       ok: totals.grand === totals.used,
-      label: 'บัตรดี + บัตรเสีย + บัตรไม่เลือก = บัตรเลือกตั้งที่ใช้',
+      label: 'จำนวนบัตรไม่ตรงกัน',
       left:  { name: 'บัตรดี + บัตรเสีย + บัตรไม่เลือก', value: totals.grand,
                parts: [totals.valid, totals.invalid, totals.noVote] },
       right: { name: 'บัตรเลือกตั้งที่ใช้', value: totals.used },
