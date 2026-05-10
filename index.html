@@ -2295,18 +2295,34 @@ function App() {
 
   const [pendingCount, setPendingCount] = React.useState(() => getPending().length);
   const [flushing, setFlushing] = React.useState(false);
+  const flushingRef = React.useRef(false);
+  // Initial flush on mount + auto-retry every 30s while pending exists.
+  // Without periodic flush, pending data sits in localStorage until volunteer
+  // reloads page or clicks the banner — risk of data loss if browser closed.
   React.useEffect(() => {
-    if (getPending().length > 0) {
+    const tryFlush = () => {
+      if (getPending().length === 0 || flushingRef.current) return;
+      flushingRef.current = true;
       setFlushing(true);
-      flushPending(setPendingCount).finally(() => setFlushing(false));
-    }
+      flushPending(setPendingCount).finally(() => {
+        flushingRef.current = false;
+        setFlushing(false);
+      });
+    };
+    tryFlush(); // initial
+    const interval = setInterval(tryFlush, 30000);
+    return () => clearInterval(interval);
   }, []);
   const onResendPending = React.useCallback(async () => {
-    if (flushing) return;
+    if (flushingRef.current) return;
+    flushingRef.current = true;
     setFlushing(true);
     try { await flushPending(setPendingCount); }
-    finally { setFlushing(false); }
-  }, [flushing]);
+    finally {
+      flushingRef.current = false;
+      setFlushing(false);
+    }
+  }, []);
 
   const onRegister = (name) => {
     const v = { name, code: generateVolCode(name), registered_at: Date.now() };
