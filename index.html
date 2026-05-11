@@ -184,20 +184,15 @@ function useElectionFlow(volunteer) {
 
   const submit = async () => {
     if (!volunteer) return;
-    update({ submitting: true });
     const seq = nextSeq();
     const submissionId = formatSubmissionId(volunteer.code, state, seq);
     const payload = collectData(state, volunteer, submissionId);
-    try {
-      const r = await submitWithRetry(payload);
-      update({ submitting: false, submitted: true, submissionId: r.submission_id || submissionId });
-    } catch (e) {
-      // backup: queue locally + show locally-computed ID (it's predictable)
-      const queue = getPending();
-      queue.push({ payload, submission_id: submissionId, savedAt: Date.now(), error: String(e?.message || e) });
-      setPendingQueue(queue);
-      update({ submitting: false, submitted: true, submissionId });
-    }
+    // Queue-first: store locally + show "saved" instantly. Background flush sends to server.
+    const queue = getPending();
+    queue.push({ payload, submission_id: submissionId, savedAt: Date.now() });
+    setPendingQueue(queue);
+    update({ submitting: false, submitted: true, submissionId });
+    window.dispatchEvent(new Event('ilaw-pending-update'));
   };
 
   const fullReset = () => setState(INITIAL_STATE);
@@ -2311,7 +2306,15 @@ function App() {
     };
     tryFlush(); // initial
     const interval = setInterval(tryFlush, 30000);
-    return () => clearInterval(interval);
+    const onPendingUpdate = () => {
+      setPendingCount(getPending().length);
+      tryFlush();
+    };
+    window.addEventListener('ilaw-pending-update', onPendingUpdate);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('ilaw-pending-update', onPendingUpdate);
+    };
   }, []);
   const onResendPending = React.useCallback(async () => {
     if (flushingRef.current) return;
