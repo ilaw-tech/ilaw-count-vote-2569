@@ -1833,25 +1833,25 @@ function setPendingQueue(arr) {
   localStorage.setItem(STORAGE_PENDING, JSON.stringify(arr));
 }
 async function flushPending(onUpdate) {
-  const queue = getPending();
-  if (queue.length === 0) {
+  const initialQueue = getPending();
+  if (initialQueue.length === 0) {
     if (onUpdate) onUpdate(0);
     return { sent: 0, remaining: 0 };
   }
-  const remaining = [];
-  let sent = 0;
-  for (const item of queue) {
+  const sentIds = new Set();
+  for (const item of initialQueue) {
     try {
       const r = await submitWithRetry(item.payload, 2);
-      if (r.status === 'ok') sent++;
-      else remaining.push(item);
-    } catch {
-      remaining.push(item);
-    }
+      if (r.status === 'ok') sentIds.add(item.submission_id);
+    } catch { /* keep in queue */ }
   }
+  // Re-read queue: new submissions may have been added during the awaits above.
+  // Remove only items we successfully sent (by submission_id); keep everything else.
+  const current = getPending();
+  const remaining = current.filter((it) => !sentIds.has(it.submission_id));
   setPendingQueue(remaining);
   if (onUpdate) onUpdate(remaining.length);
-  return { sent, remaining: remaining.length };
+  return { sent: sentIds.size, remaining: remaining.length };
 }
 
 // ============================================================
@@ -2302,6 +2302,9 @@ function App() {
       flushPending(setPendingCount).finally(() => {
         flushingRef.current = false;
         setFlushing(false);
+        // New submissions may have been queued during the flush — drain them now
+        // rather than waiting for the 30s interval.
+        if (getPending().length > 0) setTimeout(tryFlush, 0);
       });
     };
     tryFlush(); // initial
