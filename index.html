@@ -133,7 +133,7 @@ const INITIAL_STATE = {
   // Unit-filter feature (2026-05-12): fetched from server on volunteer set.
   // submittedMap: "<province>|<district>" → { normal: { "<amphoe>|<tambon>|<unit>": ["แบ่งเขต"|"บัญชีรายชื่อ"] }, "advance-out": {...}, ... }
   // isAdmin: bypass all cascade filtering — see/overwrite anything (whitelist on server).
-  submittedMap: null, isAdmin: false,
+  submittedMap: null, isAdmin: false, submittedLoading: false,
 };
 
 // ============================================================
@@ -145,22 +145,50 @@ function useElectionFlow(volunteer) {
 
   // ─── Unit-filter: fetch submitted map from server on volunteer set ───
   // Server returns { isAdmin, submitted } — submitted is keyed by "<province>|<district>"
-  // and grouped by unitType. We refetch on volunteer change OR district change (cheap;
-  // server caches 30s and invalidates on doPost).
+  // and grouped by unitType.
+  //
+  // Cold scan of 11k+ rows takes 30-60s, so we use localStorage as L1 cache (10 min TTL):
+  //   1. On mount, seed submittedMap from localStorage if recent → filter applies INSTANTLY
+  //      on return visits, no waiting for server.
+  //   2. Background fetch always refires on volunteer/district change to catch other
+  //      volunteers' submissions; server has its own 30s cache + invalidates on doPost.
+  //   3. On every fetch success, write back to localStorage so the next page reload is fast.
   const fetchIdRef = React.useRef(0);
+
+  // Mount: seed from localStorage
+  React.useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_SUBMITTED_CACHE);
+      if (!raw) return;
+      const cached = JSON.parse(raw);
+      if (!cached || !cached.ts || !cached.map) return;
+      if (Date.now() - cached.ts > SUBMITTED_CACHE_TTL_MS) return;
+      update({ submittedMap: cached.map });
+    } catch (e) { /* ignore corrupt cache */ }
+  }, []);
+
+  // Volunteer/district change: refresh from server
   React.useEffect(() => {
     if (!volunteer || !volunteer.name) return;
+    if (APPS_SCRIPT_URL === 'YOUR_URL_HERE') return;
     const myId = ++fetchIdRef.current;
-    if (APPS_SCRIPT_URL === 'YOUR_URL_HERE') return; // demo mode skip
+    update({ submittedLoading: true });
     fetch(`${APPS_SCRIPT_URL}?action=submitted&name=${encodeURIComponent(volunteer.name)}`)
       .then((r) => r.json())
       .then((data) => {
         if (myId !== fetchIdRef.current) return; // stale, ignore
         if (data && data.status === 'ok') {
-          update({ submittedMap: data.submitted || {}, isAdmin: !!data.isAdmin });
+          update({ submittedMap: data.submitted || {}, isAdmin: !!data.isAdmin, submittedLoading: false });
+          try {
+            localStorage.setItem(STORAGE_SUBMITTED_CACHE, JSON.stringify({
+              ts: Date.now(), map: data.submitted || {},
+            }));
+          } catch (e) { /* quota or disabled */ }
+        } else {
+          update({ submittedLoading: false });
         }
       })
-      .catch(() => { /* silent — filter falls back to "show all" if fetch fails */ });
+      .catch(() => update({ submittedLoading: false }));
   }, [volunteer && volunteer.name, state.district]);
 
   // Changing higher-level location invalidates lower-level + scores
@@ -334,6 +362,7 @@ function useElectionFlow(volunteer) {
     // Unit-filter additions:
     filteredProvinces, filteredDistricts, filteredAmphoes, filteredTambons, filteredUnitsList,
     submittedTypesHere, sheetNoBlocked,
+    submittedLoading: state.submittedLoading,
   };
 }
 
@@ -661,11 +690,20 @@ function CardLocation({ flow, T, accent, dark }) {
   const { state, setProvince, setDistrict, setUnitType, setAmphoe, setTambon, setUnit, setSheetNo,
     locationValid, districtsForProvince, amphoesObj, tambonsObj, unitsList, isSpecialUnit, goStep,
     filteredProvinces, filteredDistricts, filteredAmphoes, filteredTambons, filteredUnitsList,
-    sheetNoBlocked } = flow;
+    sheetNoBlocked, submittedLoading } = flow;
   return (
     <div onKeyDown={(e) => { if (e.key === 'Enter' && locationValid) goStep(2); }}>
       <HeroCard T={T} accent={accent} eyebrow="ขั้นที่ 1 จาก 4" title="เลือกหน่วยเลือกตั้ง"
         sub="เลือกตำแหน่งที่คุณกำลังตรวจคะแนน"/>
+      {submittedLoading && state.submittedMap === null && (
+        <div style={{
+          marginBottom: 12, padding: '10px 14px', borderRadius: 12,
+          background: '#eff6ff', border: '1px solid #bfdbfe',
+          color: '#1e40af', fontSize: 13, display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <Icon.Spinner size={14} stroke={2}/> กำลังโหลดสถานะหน่วย (~30 วินาที)… ระหว่างนี้ตัวเลือกยังไม่ถูกกรอง
+        </div>
+      )}
       <FormCard T={T}>
         <GroupedRow T={T} label="จังหวัด">
           <Dropdown value={state.province} onChange={setProvince}
@@ -1270,10 +1308,19 @@ function DLocation({ flow, T, accent, narrow, dark }) {
   const { state, setProvince, setDistrict, setUnitType, setAmphoe, setTambon, setUnit, setSheetNo,
     locationValid, districtsForProvince, amphoesObj, tambonsObj, unitsList, isSpecialUnit, goStep,
     filteredProvinces, filteredDistricts, filteredAmphoes, filteredTambons, filteredUnitsList,
-    sheetNoBlocked } = flow;
+    sheetNoBlocked, submittedLoading } = flow;
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}
          onKeyDown={(e) => { if (e.key === 'Enter' && locationValid) goStep(2); }}>
+      {submittedLoading && state.submittedMap === null && (
+        <div style={{
+          margin: '12px 32px 0', padding: '10px 14px', borderRadius: 12,
+          background: '#eff6ff', border: '1px solid #bfdbfe',
+          color: '#1e40af', fontSize: 13, display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <Icon.Spinner size={14} stroke={2}/> กำลังโหลดสถานะหน่วย (~30 วินาที)… ระหว่างนี้ตัวเลือกยังไม่ถูกกรอง
+        </div>
+      )}
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: narrow ? '24px 16px' : '36px 32px' }}>
         <div style={{ maxWidth: 760, margin: '0 auto' }}>
           <div style={{ marginBottom: 24 }}>
@@ -1852,6 +1899,8 @@ const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwbUKTS5niyZW_2
 const STORAGE_PENDING = 'ilaw-vote-pending';
 const STORAGE_THEME = 'ilaw-vote-theme';
 const STORAGE_VOLUNTEER = 'ilaw-vote-volunteer';
+const STORAGE_SUBMITTED_CACHE = 'ilaw-vote-submitted-cache';
+const SUBMITTED_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min — long enough to skip re-fetch on reload, short enough to stay fresh
 const STORAGE_SEQ = 'ilaw-vote-seq';
 const ACCENT = { zone: '#34a853', party: '#d6336c' };
 
