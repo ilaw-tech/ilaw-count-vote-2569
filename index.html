@@ -130,6 +130,10 @@ const INITIAL_STATE = {
   type: null, scores: {},
   override: false, other: false, overrideNote: '',  // override paths + optional note
   submitting: false, submitted: false, submissionId: '',
+  // Unit-filter feature (2026-05-12): fetched from server on volunteer set.
+  // submittedMap: "<province>|<district>" → { normal: { "<amphoe>|<tambon>|<unit>": ["แบ่งเขต"|"บัญชีรายชื่อ"] }, "advance-out": {...}, ... }
+  // isAdmin: bypass all cascade filtering — see/overwrite anything (whitelist on server).
+  submittedMap: null, isAdmin: false,
 };
 
 // ============================================================
@@ -138,6 +142,26 @@ const INITIAL_STATE = {
 function useElectionFlow(volunteer) {
   const [state, setState] = React.useState(INITIAL_STATE);
   const update = (patch) => setState((s) => ({ ...s, ...patch }));
+
+  // ─── Unit-filter: fetch submitted map from server on volunteer set ───
+  // Server returns { isAdmin, submitted } — submitted is keyed by "<province>|<district>"
+  // and grouped by unitType. We refetch on volunteer change OR district change (cheap;
+  // server caches 30s and invalidates on doPost).
+  const fetchIdRef = React.useRef(0);
+  React.useEffect(() => {
+    if (!volunteer || !volunteer.name) return;
+    const myId = ++fetchIdRef.current;
+    if (APPS_SCRIPT_URL === 'YOUR_URL_HERE') return; // demo mode skip
+    fetch(`${APPS_SCRIPT_URL}?action=submitted&name=${encodeURIComponent(volunteer.name)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (myId !== fetchIdRef.current) return; // stale, ignore
+        if (data && data.status === 'ok') {
+          update({ submittedMap: data.submitted || {}, isAdmin: !!data.isAdmin });
+        }
+      })
+      .catch(() => { /* silent — filter falls back to "show all" if fetch fails */ });
+  }, [volunteer && volunteer.name, state.district]);
 
   // Changing higher-level location invalidates lower-level + scores
   const setProvince = (p) => update({ province: p, district: '', unitType: '', amphoe: '', tambon: '', unit: '', place: '', sheetNo: '', type: null, scores: {}, override: false, other: false, overrideNote: '' });
@@ -182,6 +206,92 @@ function useElectionFlow(volunteer) {
   const candidates = districtKey ? (SAMPLE_DATA.candidates[districtKey] || []) : [];
   const parties = SAMPLE_DATA.parties;
 
+  // ─── Cascade filter: hide locations fully covered by submissions ───
+  // A หน่วย is "done" when both แบ่งเขต + บัญชีรายชื่อ have been submitted.
+  // ตำบล done = all its หน่วย done; cascades up to อำเภอ/เขต/จังหวัด.
+  // Admin bypasses all filtering (sees + can overwrite everything).
+  const submittedHere = state.submittedMap;
+  const isUnitDone = React.useCallback((provName, distId, amphoe, tambon, unitId) => {
+    const sub = submittedHere && submittedHere[`${provName}|${distId}`];
+    if (!sub) return false;
+    const types = (sub.normal && sub.normal[`${amphoe || ''}|${tambon || ''}|${unitId}`]) || [];
+    return types.indexOf('แบ่งเขต') >= 0 && types.indexOf('บัญชีรายชื่อ') >= 0;
+  }, [submittedHere]);
+  const isTambonDone = React.useCallback((provName, distId, amphoe, tambon) => {
+    const units = (SAMPLE_DATA.amphoes[`${provName}|${distId}`] || {})[amphoe]?.[tambon] || [];
+    if (units.length === 0) return false;
+    return units.every((u) => isUnitDone(provName, distId, amphoe, tambon, u.unit));
+  }, [isUnitDone]);
+  const isAmphoeDone = React.useCallback((provName, distId, amphoe) => {
+    const tambons = (SAMPLE_DATA.amphoes[`${provName}|${distId}`] || {})[amphoe] || {};
+    const keys = Object.keys(tambons);
+    if (keys.length === 0) return false;
+    return keys.every((t) => isTambonDone(provName, distId, amphoe, t));
+  }, [isTambonDone]);
+  const isDistrictDone = React.useCallback((provName, distId) => {
+    const amphoes = SAMPLE_DATA.amphoes[`${provName}|${distId}`] || {};
+    const keys = Object.keys(amphoes);
+    if (keys.length === 0) return false;
+    return keys.every((a) => isAmphoeDone(provName, distId, a));
+  }, [isAmphoeDone]);
+  const isProvinceDone = React.useCallback((provName) => {
+    const prov = SAMPLE_DATA.provinces.find((p) => p.name === provName);
+    if (!prov || !prov.districts || prov.districts.length === 0) return false;
+    return prov.districts.every((d) => isDistrictDone(provName, String(d)));
+  }, [isDistrictDone]);
+  // For advance-* (ใบที่ is text input, no list) — check the specific number user typed
+  const isSheetNoDone = React.useCallback((provName, distId, unitType, sheetNo) => {
+    if (!sheetNo) return false;
+    const sub = submittedHere && submittedHere[`${provName}|${distId}`];
+    if (!sub) return false;
+    const types = (sub[unitType] && sub[unitType][String(sheetNo)]) || [];
+    return types.indexOf('แบ่งเขต') >= 0 && types.indexOf('บัญชีรายชื่อ') >= 0;
+  }, [submittedHere]);
+  // Types already submitted for the CURRENT selection — used by Step 2 to filter cards
+  const submittedTypesHere = React.useMemo(() => {
+    if (state.isAdmin) return [];
+    if (!state.province || !state.district) return [];
+    const dKey = `${state.province}|${state.district}`;
+    const sub = submittedHere && submittedHere[dKey];
+    if (!sub) return [];
+    if (state.unitType === 'normal' && state.amphoe && state.tambon && state.unit) {
+      return (sub.normal && sub.normal[`${state.amphoe}|${state.tambon}|${state.unit}`]) || [];
+    }
+    if (state.unitType && state.unitType !== 'normal' && state.sheetNo) {
+      return (sub[state.unitType] && sub[state.unitType][String(state.sheetNo)]) || [];
+    }
+    return [];
+  }, [state.isAdmin, state.province, state.district, state.unitType, state.amphoe, state.tambon, state.unit, state.sheetNo, submittedHere]);
+  const sheetNoBlocked = React.useMemo(() => {
+    if (state.isAdmin) return false;
+    if (!isSpecialUnit || !state.sheetNo) return false;
+    return isSheetNoDone(state.province, state.district, state.unitType, state.sheetNo);
+  }, [state.isAdmin, isSpecialUnit, state.sheetNo, state.province, state.district, state.unitType, isSheetNoDone]);
+
+  // Filtered dropdown options — admin sees all; otherwise hide fully-covered nodes
+  const filteredProvinces = React.useMemo(() => {
+    if (state.isAdmin || !submittedHere) return SAMPLE_DATA.provinces;
+    return SAMPLE_DATA.provinces.filter((p) => !isProvinceDone(p.name));
+  }, [state.isAdmin, submittedHere, isProvinceDone]);
+  const filteredDistricts = React.useMemo(() => {
+    if (state.isAdmin || !submittedHere) return districtsForProvince;
+    return districtsForProvince.filter((d) => !isDistrictDone(state.province, String(d)));
+  }, [state.isAdmin, submittedHere, districtsForProvince, state.province, isDistrictDone]);
+  const filteredAmphoes = React.useMemo(() => {
+    const keys = Object.keys(amphoesObj);
+    if (state.isAdmin || !submittedHere) return keys;
+    return keys.filter((a) => !isAmphoeDone(state.province, state.district, a));
+  }, [state.isAdmin, submittedHere, amphoesObj, state.province, state.district, isAmphoeDone]);
+  const filteredTambons = React.useMemo(() => {
+    const keys = Object.keys(tambonsObj);
+    if (state.isAdmin || !submittedHere) return keys;
+    return keys.filter((t) => !isTambonDone(state.province, state.district, state.amphoe, t));
+  }, [state.isAdmin, submittedHere, tambonsObj, state.province, state.district, state.amphoe, isTambonDone]);
+  const filteredUnitsList = React.useMemo(() => {
+    if (state.isAdmin || !submittedHere) return unitsList;
+    return unitsList.filter((u) => !isUnitDone(state.province, state.district, state.amphoe, state.tambon, u.unit));
+  }, [state.isAdmin, submittedHere, unitsList, state.province, state.district, state.amphoe, state.tambon, isUnitDone]);
+
   const submit = async () => {
     if (!volunteer) return;
     const seq = nextSeq();
@@ -191,7 +301,23 @@ function useElectionFlow(volunteer) {
     const queue = getPending();
     queue.push({ payload, submission_id: submissionId, savedAt: Date.now() });
     setPendingQueue(queue);
-    update({ submitting: false, submitted: true, submissionId });
+    // Optimistic: tag this (district, location, ประเภท) as submitted locally so the
+    // dropdown filter updates immediately without waiting for server cache invalidation.
+    const ptype = state.type === 'zone' ? 'แบ่งเขต' : 'บัญชีรายชื่อ';
+    const dKey = `${state.province}|${state.district}`;
+    const locKey = state.unitType === 'normal'
+      ? `${state.amphoe}|${state.tambon}|${state.unit}`
+      : String(state.sheetNo);
+    setState((s) => {
+      const map = JSON.parse(JSON.stringify(s.submittedMap || {}));
+      if (!map[dKey]) map[dKey] = { normal: {}, 'advance-out': {}, 'advance-in': {}, overseas: {} };
+      if (!map[dKey][s.unitType]) map[dKey][s.unitType] = {};
+      if (!map[dKey][s.unitType][locKey]) map[dKey][s.unitType][locKey] = [];
+      if (map[dKey][s.unitType][locKey].indexOf(ptype) < 0) {
+        map[dKey][s.unitType][locKey].push(ptype);
+      }
+      return { ...s, submittedMap: map, submitting: false, submitted: true, submissionId };
+    });
     window.dispatchEvent(new Event('ilaw-pending-update'));
   };
 
@@ -205,6 +331,9 @@ function useElectionFlow(volunteer) {
     locationValid, districtKey, districtsForProvince,
     amphoesObj, tambonsObj, unitsList, candidates, parties,
     isSpecialUnit,
+    // Unit-filter additions:
+    filteredProvinces, filteredDistricts, filteredAmphoes, filteredTambons, filteredUnitsList,
+    submittedTypesHere, sheetNoBlocked,
   };
 }
 
@@ -446,7 +575,7 @@ function VariantCards({ flow, theme, setTheme, accent, pendingCount, onResendPen
               <span style={{ color: themeAccent, fontWeight: 700 }}>{state.step}</span>/4
             </div>
           )}
-          {volunteer && <VolunteerBadge volunteer={volunteer} onChangeUser={onChangeUser} T={T} narrow/>}
+          {volunteer && <VolunteerBadge volunteer={volunteer} onChangeUser={onChangeUser} T={T} narrow isAdmin={state.isAdmin}/>}
           <ThemeToggle theme={theme} setTheme={setTheme} T={T}/>
         </div>
       </header>
@@ -530,7 +659,9 @@ function GroupedRow({ T, label, children, last }) {
 
 function CardLocation({ flow, T, accent, dark }) {
   const { state, setProvince, setDistrict, setUnitType, setAmphoe, setTambon, setUnit, setSheetNo,
-    locationValid, districtsForProvince, amphoesObj, tambonsObj, unitsList, isSpecialUnit, goStep } = flow;
+    locationValid, districtsForProvince, amphoesObj, tambonsObj, unitsList, isSpecialUnit, goStep,
+    filteredProvinces, filteredDistricts, filteredAmphoes, filteredTambons, filteredUnitsList,
+    sheetNoBlocked } = flow;
   return (
     <div onKeyDown={(e) => { if (e.key === 'Enter' && locationValid) goStep(2); }}>
       <HeroCard T={T} accent={accent} eyebrow="ขั้นที่ 1 จาก 4" title="เลือกหน่วยเลือกตั้ง"
@@ -538,12 +669,12 @@ function CardLocation({ flow, T, accent, dark }) {
       <FormCard T={T}>
         <GroupedRow T={T} label="จังหวัด">
           <Dropdown value={state.province} onChange={setProvince}
-            options={SAMPLE_DATA.provinces.map((p) => ({ value: p.name, label: p.name }))}
+            options={filteredProvinces.map((p) => ({ value: p.name, label: p.name }))}
             placeholder="เลือกจังหวัด" accent={accent} dark={dark}/>
         </GroupedRow>
         <GroupedRow T={T} label="เขตเลือกตั้ง">
           <Dropdown value={state.district} onChange={setDistrict}
-            options={districtsForProvince.map((d) => ({ value: String(d), label: `เขต ${d}` }))}
+            options={filteredDistricts.map((d) => ({ value: String(d), label: `เขต ${d}` }))}
             placeholder="เลือกเขต" disabled={!state.province} accent={accent} dark={dark}/>
         </GroupedRow>
         <GroupedRow T={T} label="ประเภทหน่วย" last>
@@ -561,18 +692,18 @@ function CardLocation({ flow, T, accent, dark }) {
         <FormCard T={T}>
           <GroupedRow T={T} label="อำเภอ/เขต">
             <Dropdown value={state.amphoe} onChange={setAmphoe}
-              options={Object.keys(amphoesObj).map((a) => ({ value: a, label: a }))}
+              options={filteredAmphoes.map((a) => ({ value: a, label: a }))}
               placeholder="เลือกอำเภอ" accent={accent} dark={dark}/>
           </GroupedRow>
           <GroupedRow T={T} label="ตำบล/แขวง">
             <Dropdown value={state.tambon} onChange={setTambon}
-              options={Object.keys(tambonsObj).map((t) => ({ value: t, label: t }))}
+              options={filteredTambons.map((t) => ({ value: t, label: t }))}
               placeholder="เลือกตำบล" disabled={!state.amphoe} accent={accent} dark={dark}/>
           </GroupedRow>
           <GroupedRow T={T} label="หน่วยเลือกตั้ง" last>
             <Dropdown value={state.unit}
               onChange={(u) => { const f = unitsList.find((x) => x.unit === u); setUnit(u, f?.place); }}
-              options={unitsList.map((u) => ({ value: u.unit, label: `หน่วยที่ ${u.unit}` }))}
+              options={filteredUnitsList.map((u) => ({ value: u.unit, label: `หน่วยที่ ${u.unit}` }))}
               placeholder="เลือกหน่วย" disabled={!state.tambon} accent={accent} dark={dark}/>
             {state.place && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: T.muted, fontSize: 13, marginTop: 4 }}>
@@ -598,11 +729,20 @@ function CardLocation({ flow, T, accent, dark }) {
             <div style={{ fontSize: 12, color: T.muted, marginTop: 4, lineHeight: 1.5 }}>
               📄 อ้างอิงจากเอกสารใน Google Drive โฟลเดอร์ของเขตนี้ — แต่ละเขตมีจำนวนใบไม่เท่ากัน
             </div>
+            {sheetNoBlocked && (
+              <div style={{
+                marginTop: 8, padding: '8px 12px', borderRadius: 8,
+                background: '#fef2f2', border: '1px solid #fecaca',
+                color: '#991b1b', fontSize: 12, lineHeight: 1.5,
+              }}>
+                ⚠️ ใบที่ {state.sheetNo} ของหน่วยนี้บันทึกครบทั้ง <b>แบ่งเขต + บัญชีรายชื่อ</b> แล้ว — กรุณาตรวจสอบเลขใบใหม่
+              </div>
+            )}
           </GroupedRow>
         </FormCard>
       )}
 
-      <PillButton accent={accent} disabled={!locationValid} onClick={() => goStep(2)}>
+      <PillButton accent={accent} disabled={!locationValid || sheetNoBlocked} onClick={() => goStep(2)}>
         ดำเนินการต่อ <Icon.ChevronRight size={16}/>
       </PillButton>
     </div>
@@ -610,22 +750,35 @@ function CardLocation({ flow, T, accent, dark }) {
 }
 
 function CardType({ flow, T, accent }) {
-  const { state, setType, goStep } = flow;
+  const { state, setType, goStep, submittedTypesHere } = flow;
   const themeAccent = state.type === 'party' ? accent.party : accent.zone;
   React.useEffect(() => {
     const onKey = (e) => { if (e.key === 'Enter' && state.type) goStep(3); };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [state.type, goStep]);
-  const cards = [
-    { id: 'zone', icon: <Icon.Map size={32} stroke={1.4}/>, title: 'แบบแบ่งเขต', sub: 'เลือกตัวบุคคล', color: accent.zone },
-    { id: 'party', icon: <Icon.List size={32} stroke={1.4}/>, title: 'บัญชีรายชื่อ', sub: 'เลือกพรรค', color: accent.party },
+  const allCards = [
+    { id: 'zone', icon: <Icon.Map size={32} stroke={1.4}/>, title: 'แบบแบ่งเขต', sub: 'เลือกตัวบุคคล', color: accent.zone, typeName: 'แบ่งเขต' },
+    { id: 'party', icon: <Icon.List size={32} stroke={1.4}/>, title: 'บัญชีรายชื่อ', sub: 'เลือกพรรค', color: accent.party, typeName: 'บัญชีรายชื่อ' },
   ];
+  const cards = allCards.filter((c) => submittedTypesHere.indexOf(c.typeName) < 0);
+  React.useEffect(() => {
+    if (state.type && !cards.find((c) => c.id === state.type)) setType(null);
+  }, [cards.map((c) => c.id).join(','), state.type, setType]);
   return (
     <div>
       <HeroCard T={T} accent={accent.zone} eyebrow="ขั้นที่ 2 จาก 4" title="ประเภทคะแนน"
         sub="ส.ส. แบบแบ่งเขต หรือบัญชีรายชื่อ"/>
       <ChipsCard flow={flow} T={T}/>
+      {submittedTypesHere.length > 0 && cards.length > 0 && (
+        <div style={{
+          marginBottom: 12, padding: '10px 14px', borderRadius: 12,
+          background: '#fffbeb', border: '1px solid #fde68a',
+          color: '#92400e', fontSize: 13,
+        }}>
+          ℹ️ หน่วยนี้บันทึก <b>{submittedTypesHere.join(' + ')}</b> ไว้แล้ว — เหลือเฉพาะประเภทด้านล่าง
+        </div>
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 14 }}>
         {cards.map((c) => {
           const selected = state.type === c.id;
@@ -1107,7 +1260,7 @@ function DTopbar({ T, accent, flow, narrow, theme, setTheme, volunteer, onChange
           )}
         </div>
       )}
-      {volunteer && <VolunteerBadge volunteer={volunteer} onChangeUser={onChangeUser} T={T} narrow={narrow}/>}
+      {volunteer && <VolunteerBadge volunteer={volunteer} onChangeUser={onChangeUser} T={T} narrow={narrow} isAdmin={state.isAdmin}/>}
       <ThemeToggle theme={theme} setTheme={setTheme} T={T}/>
     </header>
   );
@@ -1115,7 +1268,9 @@ function DTopbar({ T, accent, flow, narrow, theme, setTheme, volunteer, onChange
 
 function DLocation({ flow, T, accent, narrow, dark }) {
   const { state, setProvince, setDistrict, setUnitType, setAmphoe, setTambon, setUnit, setSheetNo,
-    locationValid, districtsForProvince, amphoesObj, tambonsObj, unitsList, isSpecialUnit, goStep } = flow;
+    locationValid, districtsForProvince, amphoesObj, tambonsObj, unitsList, isSpecialUnit, goStep,
+    filteredProvinces, filteredDistricts, filteredAmphoes, filteredTambons, filteredUnitsList,
+    sheetNoBlocked } = flow;
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}
          onKeyDown={(e) => { if (e.key === 'Enter' && locationValid) goStep(2); }}>
@@ -1132,12 +1287,12 @@ function DLocation({ flow, T, accent, narrow, dark }) {
           }}>
             <DField label="จังหวัด" T={T}>
               <Dropdown value={state.province} onChange={setProvince}
-                options={SAMPLE_DATA.provinces.map((p) => ({ value: p.name, label: p.name }))}
+                options={filteredProvinces.map((p) => ({ value: p.name, label: p.name }))}
                 placeholder="เลือกจังหวัด" accent={accent.zone} dark={dark}/>
             </DField>
             <DField label="เขตเลือกตั้ง" T={T}>
               <Dropdown value={state.district} onChange={setDistrict}
-                options={districtsForProvince.map((d) => ({ value: String(d), label: `เขต ${d}` }))}
+                options={filteredDistricts.map((d) => ({ value: String(d), label: `เขต ${d}` }))}
                 placeholder="เลือกเขต" disabled={!state.province} accent={accent.zone} dark={dark}/>
             </DField>
             <div style={{ gridColumn: '1 / -1' }}>
@@ -1155,19 +1310,19 @@ function DLocation({ flow, T, accent, narrow, dark }) {
               <>
                 <DField label="อำเภอ/เขต" T={T}>
                   <Dropdown value={state.amphoe} onChange={setAmphoe}
-                    options={Object.keys(amphoesObj).map((a) => ({ value: a, label: a }))}
+                    options={filteredAmphoes.map((a) => ({ value: a, label: a }))}
                     placeholder="เลือกอำเภอ" accent={accent.zone} dark={dark}/>
                 </DField>
                 <DField label="ตำบล/แขวง" T={T}>
                   <Dropdown value={state.tambon} onChange={setTambon}
-                    options={Object.keys(tambonsObj).map((t) => ({ value: t, label: t }))}
+                    options={filteredTambons.map((t) => ({ value: t, label: t }))}
                     placeholder="เลือกตำบล" disabled={!state.amphoe} accent={accent.zone} dark={dark}/>
                 </DField>
                 <div style={{ gridColumn: '1 / -1' }}>
                   <DField label="หน่วยเลือกตั้ง" T={T}>
                     <Dropdown value={state.unit}
                       onChange={(u) => { const f = unitsList.find((x) => x.unit === u); setUnit(u, f?.place); }}
-                      options={unitsList.map((u) => ({ value: u.unit, label: `หน่วยที่ ${u.unit}` }))}
+                      options={filteredUnitsList.map((u) => ({ value: u.unit, label: `หน่วยที่ ${u.unit}` }))}
                       placeholder="เลือกหน่วย" disabled={!state.tambon} accent={accent.zone} dark={dark}/>
                     {state.place && (
                       <div style={{ marginTop: 8, display: 'flex', gap: 6, alignItems: 'center', color: T.muted, fontSize: 13 }}>
@@ -1193,6 +1348,15 @@ function DLocation({ flow, T, accent, narrow, dark }) {
                   <div style={{ marginTop: 8, fontSize: 12, color: T.muted, lineHeight: 1.5 }}>
                     📄 อ้างอิงจากเอกสารใน Google Drive โฟลเดอร์ของเขตนี้ — แต่ละเขตมีจำนวนใบไม่เท่ากัน
                   </div>
+                  {sheetNoBlocked && (
+                    <div style={{
+                      marginTop: 10, padding: '10px 14px', borderRadius: 10,
+                      background: '#fef2f2', border: '1px solid #fecaca',
+                      color: '#991b1b', fontSize: 13, lineHeight: 1.5,
+                    }}>
+                      ⚠️ ใบที่ {state.sheetNo} ของหน่วยนี้บันทึกครบทั้ง <b>แบ่งเขต + บัญชีรายชื่อ</b> แล้ว — กรุณาตรวจสอบเลขใบใหม่
+                    </div>
+                  )}
                 </DField>
               </div>
             )}
@@ -1201,7 +1365,7 @@ function DLocation({ flow, T, accent, narrow, dark }) {
       </div>
       <DFooter T={T}>
         <div style={{ fontSize: 12, color: T.muted }}>ข้อมูลจะบันทึกเมื่อกดส่งในขั้นสุดท้ายเท่านั้น</div>
-        <DPrimary disabled={!locationValid} accent={accent.zone} onClick={() => goStep(2)}>
+        <DPrimary disabled={!locationValid || sheetNoBlocked} accent={accent.zone} onClick={() => goStep(2)}>
           ดำเนินการต่อ <Icon.ChevronRight size={14}/>
         </DPrimary>
       </DFooter>
@@ -1210,17 +1374,24 @@ function DLocation({ flow, T, accent, narrow, dark }) {
 }
 
 function DType({ flow, T, accent, narrow }) {
-  const { state, setType, goStep } = flow;
+  const { state, setType, goStep, submittedTypesHere } = flow;
   const themeAccent = state.type === 'party' ? accent.party : accent.zone;
   React.useEffect(() => {
     const onKey = (e) => { if (e.key === 'Enter' && state.type) goStep(3); };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [state.type, goStep]);
-  const cards = [
-    { id: 'zone', icon: <Icon.Map size={32} stroke={1.4}/>, title: 'แบบแบ่งเขต', sub: 'เลือกตัวบุคคล', desc: 'นับคะแนน ส.ส. แบบรายเขต', color: accent.zone },
-    { id: 'party', icon: <Icon.List size={32} stroke={1.4}/>, title: 'บัญชีรายชื่อ', sub: 'เลือกพรรค', desc: 'นับคะแนนแบบบัญชีรายชื่อ', color: accent.party },
+  const allCards = [
+    { id: 'zone', icon: <Icon.Map size={32} stroke={1.4}/>, title: 'แบบแบ่งเขต', sub: 'เลือกตัวบุคคล', desc: 'นับคะแนน ส.ส. แบบรายเขต', color: accent.zone, typeName: 'แบ่งเขต' },
+    { id: 'party', icon: <Icon.List size={32} stroke={1.4}/>, title: 'บัญชีรายชื่อ', sub: 'เลือกพรรค', desc: 'นับคะแนนแบบบัญชีรายชื่อ', color: accent.party, typeName: 'บัญชีรายชื่อ' },
   ];
+  // Hide card if this ประเภท already submitted for the current location.
+  // Admin (state.isAdmin) → submittedTypesHere is always [] so both cards stay visible.
+  const cards = allCards.filter((c) => submittedTypesHere.indexOf(c.typeName) < 0);
+  // Auto-deselect if the previously-chosen card got hidden (e.g., user switched unit)
+  React.useEffect(() => {
+    if (state.type && !cards.find((c) => c.id === state.type)) setType(null);
+  }, [cards.map((c) => c.id).join(','), state.type, setType]);
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: narrow ? '24px 16px' : '36px 32px' }}>
@@ -1229,6 +1400,15 @@ function DType({ flow, T, accent, narrow }) {
             <h1 style={{ fontSize: narrow ? 24 : 28, fontWeight: 600, letterSpacing: '-0.02em', marginBottom: 6 }}>ประเภทคะแนน</h1>
             <p style={{ fontSize: 14, color: T.muted }}>เลือกหนึ่งประเภท ระบบจะแสดงรายชื่อให้กรอกคะแนน</p>
           </div>
+          {submittedTypesHere.length > 0 && cards.length > 0 && (
+            <div style={{
+              marginBottom: 16, padding: '10px 14px', borderRadius: 10,
+              background: '#fffbeb', border: '1px solid #fde68a',
+              color: '#92400e', fontSize: 13,
+            }}>
+              ℹ️ หน่วยนี้บันทึก <b>{submittedTypesHere.join(' + ')}</b> ไว้แล้ว — เหลือเฉพาะประเภทด้านล่าง
+            </div>
+          )}
           <div style={{ display: 'grid', gridTemplateColumns: narrow ? '1fr' : '1fr 1fr', gap: 16 }}>
             {cards.map((c) => {
               const sel = state.type === c.id;
@@ -2216,7 +2396,7 @@ function RegistrationScreen({ onRegister, theme, setTheme }) {
 // ============================================================
 // VOLUNTEER BADGE — header indicator + change-user popover
 // ============================================================
-function VolunteerBadge({ volunteer, onChangeUser, T, narrow }) {
+function VolunteerBadge({ volunteer, onChangeUser, T, narrow, isAdmin }) {
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef(null);
   React.useEffect(() => {
@@ -2227,6 +2407,17 @@ function VolunteerBadge({ volunteer, onChangeUser, T, narrow }) {
   const seq = getSeq();
   const dark = T.bg === '#0a0a0a' || T.bg === '#000';
   return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      {isAdmin && (
+        <span title="Admin mode — เห็นทุกหน่วยและ overwrite ได้" style={{
+          background: '#fef3c7', color: '#92400e',
+          border: '1px solid #fde68a', borderRadius: 100,
+          padding: narrow ? '3px 8px' : '4px 10px',
+          fontSize: 10, fontWeight: 700, letterSpacing: 0.4,
+          fontFamily: 'ui-monospace, monospace',
+          flexShrink: 0,
+        }}>🔓 ADMIN</span>
+      )}
     <div ref={ref} style={{ position: 'relative' }}>
       <button onClick={() => setOpen((o) => !o)} title={volunteer.name} style={{
         background: T.surface, color: T.fg,
@@ -2261,6 +2452,7 @@ function VolunteerBadge({ volunteer, onChangeUser, T, narrow }) {
           </button>
         </div>
       )}
+    </div>
     </div>
   );
 }
