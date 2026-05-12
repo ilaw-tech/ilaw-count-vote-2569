@@ -206,7 +206,9 @@ function useElectionFlow(volunteer) {
   const setOverrideNote = (v) => update({ overrideNote: v });
   const goStep = (n) => update({ step: n });
 
-  // Partial reset: keep province/district/unitType/amphoe/tambon, reset only scoped fields
+  // Partial reset: keep province/district/unitType/amphoe/tambon, reset only scoped fields.
+  // ALSO preserve session-level fields (submittedMap, isAdmin) so the filter keeps working
+  // after submit + "บันทึกหน่วยถัดไป" without refetching from server.
   const reset = () => setState((s) => ({
     ...INITIAL_STATE,
     step: 1,
@@ -215,6 +217,9 @@ function useElectionFlow(volunteer) {
     unitType: s.unitType,
     amphoe: s.unitType === 'normal' ? s.amphoe : '',
     tambon: s.unitType === 'normal' ? s.tambon : '',
+    submittedMap: s.submittedMap,
+    isAdmin: s.isAdmin,
+    submittedLoading: s.submittedLoading,
   }));
 
   const isSpecialUnit = state.unitType === 'advance-out' || state.unitType === 'advance-in' || state.unitType === 'overseas';
